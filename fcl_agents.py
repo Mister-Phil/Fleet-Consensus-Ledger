@@ -50,6 +50,7 @@ MAX_BACKOFF = 2.0
 # La flotte. `access_level` alimente la couche de provenance (signature, pas un gate).
 FLEET = [
     {"agent_id": "scraper-01",     "task_type": "scrape",     "access_level": "write"},
+    {"agent_id": "scraper-02",     "task_type": "scrape",     "access_level": "write"},  # ← ajout pour démo failover
     {"agent_id": "synthesizer-01", "task_type": "synthesize", "access_level": "write"},
     {"agent_id": "validator-01",   "task_type": "validate",   "access_level": "admin"},
 ]
