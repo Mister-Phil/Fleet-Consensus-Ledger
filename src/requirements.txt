@@ -1,0 +1,2 @@
+# Intentionnellement vide — toutes les dépendances runtime sont fournies
+# par le Lambda Layer (voir ../layer/requirements.txt).

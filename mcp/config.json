@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "fleet-consensus-ledger": {
+      "command": "python",
+      "args": ["mcp/server.py"],
+      "env": {
+        "DATABASE_URL": "${DATABASE_URL}",
+        "COCKROACH_SECRET_NAME": "fcl/cockroachdb",
+        "LEASE_SECONDS": "30"
+      }
+    }
+  }
+}

@@ -1,0 +1,197 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Fleet Consensus Ledger (FCL) — Medusa Black Labs
+  Deploie une flotte d'agents serverless coordonnes par CockroachDB Cloud.
+  Chaque agent = une Lambda. Aucune ne detient d'etat : l'etat vit dans le ledger.
+  Credentials CockroachDB via AWS Secrets Manager — jamais en variable d'env.
+
+# ---------------------------------------------------------------------
+# PARAMETRES
+# ---------------------------------------------------------------------
+Parameters:
+
+  CockroachSecretName:
+    Type: String
+    Default: fcl/cockroachdb
+    Description: >
+      Nom du secret Secrets Manager contenant la chaine de connexion.
+      Cree en amont (voir /deploy/README.md) — jamais commite.
+
+  LeaseSeconds:
+    Type: Number
+    Default: 30
+    MinValue: 10
+    MaxValue: 300
+    Description: >
+      Duree du bail d'une tache. Si un agent meurt, la tache redevient
+      revendicable apres ce delai. Doit rester > duree de travail typique.
+
+  FleetTickRate:
+    Type: String
+    Default: rate(1 minute)
+    Description: Cadence de reveil de la flotte (EventBridge schedule).
+
+# ---------------------------------------------------------------------
+# CONFIG PARTAGEE
+# ---------------------------------------------------------------------
+Globals:
+  Function:
+    Runtime: python3.12
+    # Timeout < LeaseSeconds n'est PAS requis : si la Lambda meurt en cours,
+    # le bail expire seul et un autre agent reprend. C'est le failover.
+    Timeout: 60
+    MemorySize: 512
+    Architectures:
+      - arm64          # Graviton : ~20% moins cher a performance egale
+    Environment:
+      Variables:
+        LEASE_SECONDS: !Ref LeaseSeconds
+        COCKROACH_SECRET_NAME: !Ref CockroachSecretName
+        POWERTOOLS_SERVICE_NAME: fleet-consensus-ledger
+
+Resources:
+
+  # -------------------------------------------------------------------
+  # COUCHE PARTAGEE — psycopg + code de consensus commun
+  # -------------------------------------------------------------------
+  FCLCoreLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: fcl-core
+      Description: psycopg[binary] + retry loop 40001 + provenance signee
+      ContentUri: ../layer/
+      CompatibleRuntimes:
+        - python3.12
+      CompatibleArchitectures:
+        - arm64
+    Metadata:
+      BuildMethod: python3.12
+
+  # -------------------------------------------------------------------
+  # LES 3 AGENTS DE LA FLOTTE
+  # Meme code, meme ledger. Seul TASK_TYPE et ACCESS_LEVEL changent.
+  # C'est ce qui rend la flotte scalable : ajouter un agent = ajouter un bloc.
+  # -------------------------------------------------------------------
+
+  ScraperAgent:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: fcl-agent-scraper
+      CodeUri: ../src/
+      Handler: agent_handler.lambda_handler
+      Layers:
+        - !Ref FCLCoreLayer
+      Environment:
+        Variables:
+          AGENT_ID: scraper-01
+          TASK_TYPE: scrape
+          ACCESS_LEVEL: write
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${CockroachSecretName}-*'
+      Events:
+        FleetTick:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref FleetTickRate
+            Name: fcl-scraper-tick
+
+  SynthesizerAgent:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: fcl-agent-synthesizer
+      CodeUri: ../src/
+      Handler: agent_handler.lambda_handler
+      Layers:
+        - !Ref FCLCoreLayer
+      Environment:
+        Variables:
+          AGENT_ID: synthesizer-01
+          TASK_TYPE: synthesize
+          ACCESS_LEVEL: write
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${CockroachSecretName}-*'
+      Events:
+        FleetTick:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref FleetTickRate
+            Name: fcl-synthesizer-tick
+
+  ValidatorAgent:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: fcl-agent-validator
+      CodeUri: ../src/
+      Handler: agent_handler.lambda_handler
+      Layers:
+        - !Ref FCLCoreLayer
+      Environment:
+        Variables:
+          AGENT_ID: validator-01
+          TASK_TYPE: validate
+          ACCESS_LEVEL: admin
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${CockroachSecretName}-*'
+      Events:
+        FleetTick:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref FleetTickRate
+            Name: fcl-validator-tick
+
+  # -------------------------------------------------------------------
+  # SEEDER — cree une mission + ses taches. Invocation manuelle (demo).
+  # -------------------------------------------------------------------
+  MissionSeeder:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: fcl-mission-seeder
+      CodeUri: ../src/
+      Handler: seed_handler.lambda_handler
+      Layers:
+        - !Ref FCLCoreLayer
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${CockroachSecretName}-*'
+
+  # -------------------------------------------------------------------
+  # ALARME — un pic de 40001 signale une contention anormale dans la flotte.
+  # Le retry loop encaisse ; l'alarme dit au CTO que la flotte est trop dense.
+  # -------------------------------------------------------------------
+  SerializationConflictAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: fcl-serialization-conflicts-high
+      AlarmDescription: >
+        Volume anormal de conflits 40001 — la flotte sature le ledger.
+        Action: reduire la densite d'agents ou partitionner par task_type.
+      Namespace: FleetConsensusLedger
+      MetricName: SerializationConflicts
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+# ---------------------------------------------------------------------
+# SORTIES
+# ---------------------------------------------------------------------
+Outputs:
+
+  FleetFunctions:
+    Description: Les 3 agents deployes
+    Value: !Sub '${ScraperAgent}, ${SynthesizerAgent}, ${ValidatorAgent}'
+
+  SeederFunction:
+    Description: Invoquer pour creer une mission de demo
+    Value: !Ref MissionSeeder
+
+  SeedCommand:
+    Description: Commande de demarrage de la demo
+    Value: !Sub 'aws lambda invoke --function-name ${MissionSeeder} out.json'
